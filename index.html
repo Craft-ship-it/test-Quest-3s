@@ -69,7 +69,7 @@
       this.inicio = 0;
       this.el.sceneEl.addEventListener('enter-vr', function () {
         self.inicio = Date.now();
-        if (self.dica) self.dica.setAttribute('value', 'Mostre a palma da mao aberta');
+        if (self.dica) self.dica.setAttribute('value', 'Mostre a palma aberta para o rosto');
       });
       this.el.sceneEl.addEventListener('exit-vr', function () {
         self.inicio = 0;
@@ -92,11 +92,9 @@
         grupo.add(m);
         return m;
       }, this);
-      var etiqueta = criarEtiqueta(lado === 'left' ? 'Mão esquerda' : 'Mão direita', cor);
-      grupo.add(etiqueta);
       this.el.sceneEl.object3D.add(grupo);
       var mao = {
-        grupo: grupo, juntas: juntas, ossos: ossos, etiqueta: etiqueta,
+        grupo: grupo, juntas: juntas, ossos: ossos,
         pos: NOMES.map(function () { return new THREE.Vector3(); }),
         ok: NOMES.map(function () { return false; })
       };
@@ -139,9 +137,6 @@
           o.visible = false;
         }
       }
-      mao.etiqueta.position.copy(mao.pos[0]);
-      mao.etiqueta.position.y += 0.1;
-      mao.etiqueta.visible = mao.ok[0];
     },
 
     tick: function () {
@@ -180,10 +175,10 @@
     .concat(DEDOS4.map(function (d) { return d + '-tip'; }))
     .concat(DEDOS4.map(function (d) { return d + '-phalanx-proximal'; }));
   var MODELOS = [
-    { cor: 0xff6b6b, geo: function () { return new THREE.BoxGeometry(0.05, 0.05, 0.05); } },
-    { cor: 0x4ecdc4, geo: function () { return new THREE.SphereGeometry(0.03, 16, 12); } },
-    { cor: 0xffe66d, geo: function () { return new THREE.CylinderGeometry(0.025, 0.025, 0.05, 16); } },
-    { cor: 0xa78bfa, geo: function () { return new THREE.ConeGeometry(0.03, 0.055, 16); } }
+    { cor: 0xff6b6b, geo: function () { return new THREE.BoxGeometry(0.035, 0.035, 0.035); } },
+    { cor: 0x4ecdc4, geo: function () { return new THREE.SphereGeometry(0.02, 16, 12); } },
+    { cor: 0xffe66d, geo: function () { return new THREE.CylinderGeometry(0.017, 0.017, 0.035, 16); } },
+    { cor: 0xa78bfa, geo: function () { return new THREE.ConeGeometry(0.02, 0.04, 16); } }
   ];
   function criarBloco(i) {
     var m = MODELOS[i];
@@ -197,7 +192,7 @@
     return true;
   }
   function novoEstado() {
-    return { aberta: false, pinca: false, seguro: null, n: new THREE.Vector3(), centro: new THREE.Vector3() };
+    return { aberta: false, pinca: false, seguro: null, espera: 0, n: new THREE.Vector3(), centro: new THREE.Vector3() };
   }
 
   AFRAME.registerComponent('menu-blocos', {
@@ -208,17 +203,19 @@
       this.menu.visible = false;
       this.menu.scale.setScalar(0.001);
       this.cena3d.add(this.menu);
+      // Barra deitada sobre a mão (como a barra de itens do Minecraft)
       this.menu.add(new THREE.Mesh(
-        new THREE.PlaneGeometry(0.11, 0.30),
-        new THREE.MeshBasicMaterial({ color: 0x0b1020, transparent: true, opacity: 0.6, side: THREE.DoubleSide })
+        new THREE.PlaneGeometry(0.22, 0.06),
+        new THREE.MeshBasicMaterial({ color: 0x0b1020, transparent: true, opacity: 0.65, side: THREE.DoubleSide })
       ));
-      var titulo = criarEtiqueta('Blocos', '#ffffff');
-      titulo.scale.set(0.1, 0.025, 1);
-      titulo.position.set(0, 0.175, 0.01);
-      this.menu.add(titulo);
+      var matSlot = new THREE.MeshBasicMaterial({ color: 0x475569, transparent: true, opacity: 0.8, side: THREE.DoubleSide });
       this.itens = MODELOS.map(function (m, i) {
+        var x = (i - 1.5) * 0.05;
+        var slot = new THREE.Mesh(new THREE.PlaneGeometry(0.043, 0.043), matSlot);
+        slot.position.set(x, 0, 0.002);
+        self.menu.add(slot);
         var mesh = criarBloco(i);
-        mesh.position.set(0, 0.105 - i * 0.07, 0.025);
+        mesh.position.set(x, 0, 0.022);
         self.menu.add(mesh);
         return { mesh: mesh, indice: i, escala: 1 };
       });
@@ -236,10 +233,15 @@
       this.dc = new THREE.Vector3();
       this.p = new THREE.Vector3();
       this.w = new THREE.Vector3();
+      this.f = new THREE.Vector3();
+      this.s = new THREE.Vector3();
+      this.yv = new THREE.Vector3();
+      this.mat = new THREE.Matrix4();
+      this.q = new THREE.Quaternion();
     },
 
     // Mão aberta (4 dedos esticados) com a palma para cima ou virada para o rosto
-    avaliarGesto: function (m, lado, est) {
+    avaliarGesto: function (m, lado, est, dt) {
       var w = pt(m, 'wrist');
       var minimo = Infinity;
       for (var i = 0; i < DEDOS4.length; i++) {
@@ -254,17 +256,22 @@
       this.n.normalize();
       this.c.addVectors(w, pt(m, 'middle-finger-phalanx-proximal')).multiplyScalar(0.5);
       this.dc.subVectors(this.cabeca, this.c).normalize();
-      var paraCima = this.n.y;
       var paraRosto = this.n.dot(this.dc);
-      var limiteOrient = est.aberta ? 0.2 : 0.5;
+      var limiteOrient = est.aberta ? 0.35 : 0.65;
       var limiteDedos = est.aberta ? 1.35 : 1.55;
-      est.aberta = minimo > limiteDedos && (paraCima > limiteOrient || paraRosto > limiteOrient);
+      var candidato = minimo > limiteDedos && paraRosto > limiteOrient &&
+        this.c.distanceTo(this.cabeca) < 0.75 && this.c.y > this.cabeca.y - 0.55;
+      if (est.aberta) { est.aberta = candidato; est.espera = 0; }
+      else if (candidato) {
+        est.espera += dt || 16;
+        if (est.espera > 150) { est.aberta = true; est.espera = 0; }
+      } else est.espera = 0;
       est.n.copy(this.n);
       est.centro.copy(this.c);
     },
 
     pegar: function (est, ponto) {
-      var raio = 0.07, melhor = null, i, d;
+      var raio = 0.045, melhor = null, i, d;
       if (this.dono && this.menu.visible) {
         this.menu.updateMatrixWorld(true);
         for (i = 0; i < this.itens.length; i++) {
@@ -275,6 +282,7 @@
         if (melhor) {
           var novo = criarBloco(melhor.indice);
           novo.position.copy(ponto);
+          novo.scale.setScalar(1.6);
           this.cena3d.add(novo);
           this.colocados.push(novo);
           if (this.colocados.length > 40) {
@@ -289,6 +297,8 @@
           return;
         }
       }
+      raio = 0.06;
+      melhor = null;
       for (i = 0; i < this.colocados.length; i++) {
         var b = this.colocados[i];
         if (b === this.est.left.seguro || b === this.est.right.seguro) continue;
@@ -317,7 +327,7 @@
         est = this.est[lado];
         vis[lado] = !!(m && m.grupo.visible && pronto(m));
         if (vis[lado]) {
-          this.avaliarGesto(m, lado, est);
+          this.avaliarGesto(m, lado, est, dt);
         } else {
           est.aberta = false; est.pinca = false; est.seguro = null;
         }
@@ -338,18 +348,27 @@
       // Posição, tamanho e giro do menu
       if (this.dono) {
         est = this.est[this.dono];
-        // Palma virada para o rosto: menu na frente da palma. Palma para cima: menu mais alto, acima da mão.
-        this.alvo.copy(est.centro).addScaledVector(est.n, 0.10 + 0.07 * Math.max(0, est.n.y));
-        if (this.snap || this.menu.scale.x < 0.05) this.menu.position.copy(this.alvo);
-        else this.menu.position.lerp(this.alvo, 0.35);
+        // A barra fica no plano da palma, rente à mão, acompanhando a inclinação dela
+        var md = maos[this.dono];
+        this.f.subVectors(pt(md, 'middle-finger-phalanx-proximal'), pt(md, 'wrist')).normalize();
+        this.s.crossVectors(this.f, est.n).normalize();
+        this.yv.crossVectors(est.n, this.s);
+        this.mat.makeBasis(this.s, this.yv, est.n);
+        this.q.setFromRotationMatrix(this.mat);
+        this.alvo.copy(est.centro).addScaledVector(est.n, 0.035);
+        if (this.snap || this.menu.scale.x < 0.05) {
+          this.menu.position.copy(this.alvo);
+          this.menu.quaternion.copy(this.q);
+        } else {
+          this.menu.position.lerp(this.alvo, 0.5);
+          this.menu.quaternion.slerp(this.q, 0.4);
+        }
         this.snap = false;
       }
       var s = this.menu.scale.x + ((this.dono ? 1 : 0) - this.menu.scale.x) * 0.25;
       s = Math.max(s, 0.001);
       this.menu.scale.setScalar(s);
       this.menu.visible = s > 0.03;
-      this.p.set(this.cabeca.x, this.menu.position.y, this.cabeca.z);
-      this.menu.lookAt(this.p);
       this.menu.updateMatrixWorld(true);
 
       // Itens giram e crescem quando o dedo da outra mão chega perto
@@ -361,7 +380,7 @@
           item.mesh.getWorldPosition(this.w);
           for (var k = 0; k < 2; k++) {
             if (lados[k] !== this.dono && vis[lados[k]] &&
-                pt(maos[lados[k]], 'index-finger-tip').distanceTo(this.w) < 0.06) perto = true;
+                pt(maos[lados[k]], 'index-finger-tip').distanceTo(this.w) < 0.05) perto = true;
           }
         }
         item.escala += ((perto ? 1.3 : 1) - item.escala) * 0.3;
