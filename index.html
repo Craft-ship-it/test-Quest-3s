@@ -192,7 +192,7 @@
     return true;
   }
   function novoEstado() {
-    return { aberta: false, pinca: false, seguro: null, espera: 0, n: new THREE.Vector3(), centro: new THREE.Vector3() };
+    return { aberta: false, pinca: false, seguro: null, espera: 0, ponto: new THREE.Vector3(), q0: new THREE.Quaternion(), b0: new THREE.Quaternion(), off: new THREE.Vector3(), n: new THREE.Vector3(), centro: new THREE.Vector3() };
   }
 
   AFRAME.registerComponent('menu-blocos', {
@@ -238,6 +238,12 @@
       this.yv = new THREE.Vector3();
       this.mat = new THREE.Matrix4();
       this.q = new THREE.Quaternion();
+      this.qa = new THREE.Quaternion();
+      this.qd = new THREE.Quaternion();
+      this.qi = new THREE.Quaternion();
+      this.modoDuas = false;
+      this.d0 = 0.1;
+      this.s0 = 1;
     },
 
     // Mão aberta (4 dedos esticados) com a palma para cima ou virada para o rosto
@@ -270,8 +276,42 @@
       est.centro.copy(this.c);
     },
 
-    pegar: function (est, ponto) {
+    // Orientação da mão (como um "giroscópio") calculada pelas articulações
+    orientacaoMao: function (m, lado, saida) {
+      var w = pt(m, 'wrist');
+      this.f.subVectors(pt(m, 'middle-finger-phalanx-proximal'), w).normalize();
+      this.v1.subVectors(pt(m, 'index-finger-metacarpal'), w);
+      this.v2.subVectors(pt(m, 'pinky-finger-metacarpal'), w);
+      if (lado === 'right') this.n.crossVectors(this.v1, this.v2);
+      else this.n.crossVectors(this.v2, this.v1);
+      this.n.normalize();
+      this.s.crossVectors(this.f, this.n).normalize();
+      this.yv.crossVectors(this.n, this.s);
+      this.mat.makeBasis(this.s, this.yv, this.n);
+      saida.setFromRotationMatrix(this.mat);
+    },
+
+    // Guarda como o bloco estava em relação à mão no momento em que a mão o segurou
+    rebase: function (est, bloco, m, lado) {
+      this.orientacaoMao(m, lado, est.q0);
+      est.b0.copy(bloco.quaternion);
+      est.off.subVectors(bloco.position, est.ponto);
+    },
+
+    pegar: function (lado, est, m) {
+      var ponto = est.ponto;
       var raio = 0.045, melhor = null, i, d;
+
+      // Segundo gesto: a outra mão já segura um bloco e esta pinça perto dele -> segura com as duas mãos
+      var outro = this.est[lado === 'left' ? 'right' : 'left'];
+      if (outro.pinca && outro.seguro) {
+        var bo = outro.seguro;
+        if (bo.position.distanceTo(ponto) < Math.max(0.1, 0.045 * bo.scale.x)) {
+          est.seguro = bo;
+          return;
+        }
+      }
+
       if (this.dono && this.menu.visible) {
         this.menu.updateMatrixWorld(true);
         for (i = 0; i < this.itens.length; i++) {
@@ -294,18 +334,24 @@
             if (this.est.right.seguro === velho) this.est.right.seguro = null;
           }
           est.seguro = novo;
+          this.rebase(est, novo, m, lado);
           return;
         }
       }
-      raio = 0.06;
+
+      // Pegar de novo um bloco já solto (o alcance cresce com o tamanho do bloco)
+      var melhorFolga = 0;
       melhor = null;
       for (i = 0; i < this.colocados.length; i++) {
         var b = this.colocados[i];
         if (b === this.est.left.seguro || b === this.est.right.seguro) continue;
-        d = b.position.distanceTo(ponto);
-        if (d < raio) { raio = d; melhor = b; }
+        var folga = Math.max(0.06, 0.03 * b.scale.x) - b.position.distanceTo(ponto);
+        if (folga > melhorFolga) { melhorFolga = folga; melhor = b; }
       }
-      if (melhor) est.seguro = melhor;
+      if (melhor) {
+        est.seguro = melhor;
+        this.rebase(est, melhor, m, lado);
+      }
     },
 
     tick: function (time, dt) {
@@ -397,16 +443,49 @@
         var polegar = pt(m, 'thumb-tip');
         var indicador = pt(m, 'index-finger-tip');
         var dist = polegar.distanceTo(indicador);
-        this.p.addVectors(polegar, indicador).multiplyScalar(0.5);
+        est.ponto.addVectors(polegar, indicador).multiplyScalar(0.5);
         var ehDono = this.dono === lado;
         if (!est.pinca && dist < 0.022 && !ehDono) {
           est.pinca = true;
-          this.pegar(est, this.p);
+          this.pegar(lado, est, m);
         } else if (est.pinca && (dist > 0.04 || ehDono)) {
           est.pinca = false;
           est.seguro = null;
         }
-        if (est.pinca && est.seguro) est.seguro.position.lerp(this.p, 0.6);
+      }
+
+      var ea = this.est.left, eb = this.est.right;
+      var duas = ea.pinca && eb.pinca && ea.seguro && ea.seguro === eb.seguro;
+      if (duas) {
+        // Duas mãos no mesmo bloco: afastar aumenta, aproximar diminui
+        var bloco = ea.seguro;
+        var distMaos = ea.ponto.distanceTo(eb.ponto);
+        if (!this.modoDuas) {
+          this.modoDuas = true;
+          this.d0 = Math.max(distMaos, 0.03);
+          this.s0 = bloco.scale.x;
+        }
+        var esc = Math.min(Math.max(this.s0 * distMaos / this.d0, 0.3), 10);
+        bloco.scale.setScalar(bloco.scale.x + (esc - bloco.scale.x) * 0.4);
+        this.p.addVectors(ea.ponto, eb.ponto).multiplyScalar(0.5);
+        bloco.position.lerp(this.p, 0.6);
+      } else {
+        for (i = 0; i < 2; i++) {
+          lado = lados[i];
+          est = this.est[lado];
+          if (!vis[lado] || !est.pinca || !est.seguro) continue;
+          m = maos[lado];
+          if (this.modoDuas) this.rebase(est, est.seguro, m, lado);
+          // Girar a mão com o bloco na pinça gira o bloco junto
+          this.orientacaoMao(m, lado, this.qa);
+          this.qi.copy(est.q0).invert();
+          this.qd.copy(this.qa).multiply(this.qi);
+          this.q.copy(this.qd).multiply(est.b0);
+          est.seguro.quaternion.slerp(this.q, 0.5);
+          this.w.copy(est.off).applyQuaternion(this.qd).add(est.ponto);
+          est.seguro.position.lerp(this.w, 0.6);
+        }
+        this.modoDuas = false;
       }
     }
   });
