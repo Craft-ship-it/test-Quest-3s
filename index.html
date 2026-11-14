@@ -2,7 +2,7 @@
 <html lang="pt-BR">
 <head>
 <meta charset="utf-8">
-<title>Esqueleto das mãos em AR</title>
+<title>Menu de blocos na mão (AR)</title>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <style>
   html, body { margin: 0; height: 100%; background: #0b1020; }
@@ -69,7 +69,7 @@
       this.inicio = 0;
       this.el.sceneEl.addEventListener('enter-vr', function () {
         self.inicio = Date.now();
-        if (self.dica) self.dica.setAttribute('value', 'Mostre as maos para o Quest');
+        if (self.dica) self.dica.setAttribute('value', 'Mostre a palma da mao aberta');
       });
       this.el.sceneEl.addEventListener('exit-vr', function () {
         self.inicio = 0;
@@ -114,7 +114,7 @@
           var p = pose.transform.position;
           mao.pos[i].set(p.x, p.y, p.z);
           m.position.copy(mao.pos[i]);
-          m.scale.setScalar(Math.max(pose.radius || 0.008, 0.006) * 0.9);
+          m.scale.setScalar(Math.min(Math.max(pose.radius || 0.008, 0.006) * 0.9, 0.011));
           m.visible = true;
           mao.ok[i] = true;
         } else {
@@ -173,6 +173,224 @@
       }
     }
   });
+
+  // ---------- Menu de blocos na palma da mão ----------
+  var DEDOS4 = ['index-finger', 'middle-finger', 'ring-finger', 'pinky-finger'];
+  var NECESSARIOS = ['wrist', 'thumb-tip', 'index-finger-metacarpal', 'pinky-finger-metacarpal']
+    .concat(DEDOS4.map(function (d) { return d + '-tip'; }))
+    .concat(DEDOS4.map(function (d) { return d + '-phalanx-proximal'; }));
+  var MODELOS = [
+    { cor: 0xff6b6b, geo: function () { return new THREE.BoxGeometry(0.05, 0.05, 0.05); } },
+    { cor: 0x4ecdc4, geo: function () { return new THREE.SphereGeometry(0.03, 16, 12); } },
+    { cor: 0xffe66d, geo: function () { return new THREE.CylinderGeometry(0.025, 0.025, 0.05, 16); } },
+    { cor: 0xa78bfa, geo: function () { return new THREE.ConeGeometry(0.03, 0.055, 16); } }
+  ];
+  function criarBloco(i) {
+    var m = MODELOS[i];
+    var bloco = new THREE.Mesh(m.geo(), new THREE.MeshStandardMaterial({ color: m.cor, roughness: 0.5, metalness: 0.1 }));
+    bloco.userData.indice = i;
+    return bloco;
+  }
+  function pt(m, nome) { return m.pos[INDICE[nome]]; }
+  function pronto(m) {
+    for (var i = 0; i < NECESSARIOS.length; i++) if (!m.ok[INDICE[NECESSARIOS[i]]]) return false;
+    return true;
+  }
+  function novoEstado() {
+    return { aberta: false, pinca: false, seguro: null, n: new THREE.Vector3(), centro: new THREE.Vector3() };
+  }
+
+  AFRAME.registerComponent('menu-blocos', {
+    init: function () {
+      var self = this;
+      this.cena3d = this.el.sceneEl.object3D;
+      this.menu = new THREE.Group();
+      this.menu.visible = false;
+      this.menu.scale.setScalar(0.001);
+      this.cena3d.add(this.menu);
+      this.menu.add(new THREE.Mesh(
+        new THREE.PlaneGeometry(0.11, 0.30),
+        new THREE.MeshBasicMaterial({ color: 0x0b1020, transparent: true, opacity: 0.6, side: THREE.DoubleSide })
+      ));
+      var titulo = criarEtiqueta('Blocos', '#ffffff');
+      titulo.scale.set(0.1, 0.025, 1);
+      titulo.position.set(0, 0.175, 0.01);
+      this.menu.add(titulo);
+      this.itens = MODELOS.map(function (m, i) {
+        var mesh = criarBloco(i);
+        mesh.position.set(0, 0.105 - i * 0.07, 0.025);
+        self.menu.add(mesh);
+        return { mesh: mesh, indice: i, escala: 1 };
+      });
+      this.est = { left: novoEstado(), right: novoEstado() };
+      this.dono = null;
+      this.snap = false;
+      this.colocados = [];
+      this.esq = null;
+      this.cabeca = new THREE.Vector3();
+      this.alvo = new THREE.Vector3();
+      this.v1 = new THREE.Vector3();
+      this.v2 = new THREE.Vector3();
+      this.n = new THREE.Vector3();
+      this.c = new THREE.Vector3();
+      this.dc = new THREE.Vector3();
+      this.p = new THREE.Vector3();
+      this.w = new THREE.Vector3();
+    },
+
+    // Mão aberta (4 dedos esticados) com a palma para cima ou virada para o rosto
+    avaliarGesto: function (m, lado, est) {
+      var w = pt(m, 'wrist');
+      var minimo = Infinity;
+      for (var i = 0; i < DEDOS4.length; i++) {
+        var ponta = pt(m, DEDOS4[i] + '-tip');
+        var base = pt(m, DEDOS4[i] + '-phalanx-proximal');
+        minimo = Math.min(minimo, w.distanceTo(ponta) / Math.max(w.distanceTo(base), 1e-4));
+      }
+      this.v1.subVectors(pt(m, 'index-finger-metacarpal'), w);
+      this.v2.subVectors(pt(m, 'pinky-finger-metacarpal'), w);
+      if (lado === 'right') this.n.crossVectors(this.v1, this.v2);
+      else this.n.crossVectors(this.v2, this.v1);
+      this.n.normalize();
+      this.c.addVectors(w, pt(m, 'middle-finger-phalanx-proximal')).multiplyScalar(0.5);
+      this.dc.subVectors(this.cabeca, this.c).normalize();
+      var paraCima = this.n.y;
+      var paraRosto = this.n.dot(this.dc);
+      var limiteOrient = est.aberta ? 0.2 : 0.5;
+      var limiteDedos = est.aberta ? 1.35 : 1.55;
+      est.aberta = minimo > limiteDedos && (paraCima > limiteOrient || paraRosto > limiteOrient);
+      est.n.copy(this.n);
+      est.centro.copy(this.c);
+    },
+
+    pegar: function (est, ponto) {
+      var raio = 0.07, melhor = null, i, d;
+      if (this.dono && this.menu.visible) {
+        this.menu.updateMatrixWorld(true);
+        for (i = 0; i < this.itens.length; i++) {
+          this.itens[i].mesh.getWorldPosition(this.w);
+          d = this.w.distanceTo(ponto);
+          if (d < raio) { raio = d; melhor = this.itens[i]; }
+        }
+        if (melhor) {
+          var novo = criarBloco(melhor.indice);
+          novo.position.copy(ponto);
+          this.cena3d.add(novo);
+          this.colocados.push(novo);
+          if (this.colocados.length > 40) {
+            var velho = this.colocados.shift();
+            this.cena3d.remove(velho);
+            velho.geometry.dispose();
+            velho.material.dispose();
+            if (this.est.left.seguro === velho) this.est.left.seguro = null;
+            if (this.est.right.seguro === velho) this.est.right.seguro = null;
+          }
+          est.seguro = novo;
+          return;
+        }
+      }
+      for (i = 0; i < this.colocados.length; i++) {
+        var b = this.colocados[i];
+        if (b === this.est.left.seguro || b === this.est.right.seguro) continue;
+        d = b.position.distanceTo(ponto);
+        if (d < raio) { raio = d; melhor = b; }
+      }
+      if (melhor) est.seguro = melhor;
+    },
+
+    tick: function (time, dt) {
+      if (!this.esq) {
+        var e = document.querySelector('[esqueleto-maos]');
+        this.esq = e && e.components['esqueleto-maos'];
+        if (!this.esq) return;
+      }
+      var cena = this.el.sceneEl;
+      var maos = this.esq.maos;
+      var lados = ['left', 'right'];
+      var vis = {};
+      var i, lado, est, m;
+      cena.camera.getWorldPosition(this.cabeca);
+
+      for (i = 0; i < 2; i++) {
+        lado = lados[i];
+        m = maos[lado];
+        est = this.est[lado];
+        vis[lado] = !!(m && m.grupo.visible && pronto(m));
+        if (vis[lado]) {
+          this.avaliarGesto(m, lado, est);
+        } else {
+          est.aberta = false; est.pinca = false; est.seguro = null;
+        }
+      }
+
+      // Quem mostra a mão aberta vira o "dono" do menu (vale para qualquer mão)
+      if (this.dono && !(vis[this.dono] && this.est[this.dono].aberta)) this.dono = null;
+      if (!this.dono) {
+        for (i = 0; i < 2; i++) {
+          lado = lados[i];
+          est = this.est[lado];
+          if (vis[lado] && est.aberta && !est.pinca && !est.seguro) {
+            this.dono = lado; this.snap = true; break;
+          }
+        }
+      }
+
+      // Posição, tamanho e giro do menu
+      if (this.dono) {
+        est = this.est[this.dono];
+        // Palma virada para o rosto: menu na frente da palma. Palma para cima: menu mais alto, acima da mão.
+        this.alvo.copy(est.centro).addScaledVector(est.n, 0.10 + 0.07 * Math.max(0, est.n.y));
+        if (this.snap || this.menu.scale.x < 0.05) this.menu.position.copy(this.alvo);
+        else this.menu.position.lerp(this.alvo, 0.35);
+        this.snap = false;
+      }
+      var s = this.menu.scale.x + ((this.dono ? 1 : 0) - this.menu.scale.x) * 0.25;
+      s = Math.max(s, 0.001);
+      this.menu.scale.setScalar(s);
+      this.menu.visible = s > 0.03;
+      this.p.set(this.cabeca.x, this.menu.position.y, this.cabeca.z);
+      this.menu.lookAt(this.p);
+      this.menu.updateMatrixWorld(true);
+
+      // Itens giram e crescem quando o dedo da outra mão chega perto
+      var giro = (dt || 16) / 1000 * 1.2;
+      for (i = 0; i < this.itens.length; i++) {
+        var item = this.itens[i];
+        var perto = false;
+        if (this.dono && this.menu.visible) {
+          item.mesh.getWorldPosition(this.w);
+          for (var k = 0; k < 2; k++) {
+            if (lados[k] !== this.dono && vis[lados[k]] &&
+                pt(maos[lados[k]], 'index-finger-tip').distanceTo(this.w) < 0.06) perto = true;
+          }
+        }
+        item.escala += ((perto ? 1.3 : 1) - item.escala) * 0.3;
+        item.mesh.scale.setScalar(item.escala);
+        item.mesh.rotation.y += giro;
+      }
+
+      // Pinça (polegar + indicador) com a outra mão pega um bloco; soltar deixa no ar
+      for (i = 0; i < 2; i++) {
+        lado = lados[i];
+        if (!vis[lado]) continue;
+        est = this.est[lado];
+        m = maos[lado];
+        var polegar = pt(m, 'thumb-tip');
+        var indicador = pt(m, 'index-finger-tip');
+        var dist = polegar.distanceTo(indicador);
+        this.p.addVectors(polegar, indicador).multiplyScalar(0.5);
+        var ehDono = this.dono === lado;
+        if (!est.pinca && dist < 0.022 && !ehDono) {
+          est.pinca = true;
+          this.pegar(est, this.p);
+        } else if (est.pinca && (dist > 0.04 || ehDono)) {
+          est.pinca = false;
+          est.seguro = null;
+        }
+        if (est.pinca && est.seguro) est.seguro.position.lerp(this.p, 0.6);
+      }
+    }
+  });
 })();
 </script>
 </head>
@@ -187,7 +405,10 @@
   <a-entity camera look-controls position="0 1.6 0"></a-entity>
   <a-text id="dica" value="Toque em AR (canto inferior direito)" position="0 1.5 -1"
           align="center" width="1.6" color="#ffffff"></a-text>
+  <a-entity light="type: ambient; intensity: 0.8"></a-entity>
+  <a-entity light="type: directional; intensity: 0.9" position="1 3 2"></a-entity>
   <a-entity esqueleto-maos></a-entity>
+  <a-entity menu-blocos></a-entity>
 </a-scene>
 </body>
 </html>
